@@ -11,6 +11,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/json"
 	"os"
+	"time"
 
 	"log"
 	"net"
@@ -18,11 +19,16 @@ import (
 	"strings"
 )
 
+type scheTask struct {
+	time    time.Time
+	scheReq common.ScheduleReq
+}
+
 type Server struct {
 	addr      string
 	nodeList  v1.NodeList
 	conns     map[string]*net.Conn
-	scheQueue map[string]common.ScheduleReq
+	scheQueue map[string]scheTask
 }
 
 func NewServer(addr string) *Server {
@@ -30,7 +36,7 @@ func NewServer(addr string) *Server {
 		addr:      addr,
 		nodeList:  v1.NodeList{},
 		conns:     make(map[string]*net.Conn),
-		scheQueue: make(map[string]common.ScheduleReq),
+		scheQueue: make(map[string]scheTask),
 	}
 }
 
@@ -121,7 +127,11 @@ func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Println("Received ScheduleReq: ", req, "Node list: ", s.nodeList)
 	uid := uuid.New().String()
-	s.scheQueue[uid] = req
+	stask := scheTask{
+		time:    time.Now(),
+		scheReq: req,
+	}
+	s.scheQueue[uid] = stask
 	nodes := controller.SelectNodeBasedOnResources(&(s.nodeList), req.ComRequired, req.DeviceRequired)
 	fmt.Println("SelectNodeBasedOnResources: ", nodes)
 	m := common.Message{}
@@ -164,11 +174,12 @@ func (s *Server) HandleWSMessage(conn *net.Conn, m common.Message) {
 			delete(s.scheQueue, m.MessageID)
 			nodeName := res.NodeName
 			//clientIP := getClientIP(conn)
-			s.writeFile(m.Content, nodeName)
+			latency := time.Now().UnixMicro() - scheReq.time.UnixMicro()
+			s.writeFile(scheReq.scheReq, nodeName, latency)
 			ackMsg := common.Message{
 				MessageType: common.ScheduleConfirmationAckType,
 				MessageID:   m.MessageID,
-				Content:     common.ScheduleConfirmationAck{ScheduleReq: scheReq, Ack: true},
+				Content:     common.ScheduleConfirmationAck{ScheduleReq: scheReq.scheReq, Ack: true},
 			}
 			s.sendMsg(nodeName, ackMsg)
 		}
