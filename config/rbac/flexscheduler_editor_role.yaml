@@ -1,0 +1,31 @@
+# permissions for end users to edit flexschedulers.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: clusterrole
+    app.kubernetes.io/instance: flexscheduler-editor-role
+    app.kubernetes.io/component: rbac
+    app.kubernetes.io/created-by: flex-scheduler
+    app.kubernetes.io/part-of: flex-scheduler
+    app.kubernetes.io/managed-by: kustomize
+  name: flexscheduler-editor-role
+rules:
+- apiGroups:
+  - scheduling.flexcluster.io
+  resources:
+  - flexschedulers
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - scheduling.flexcluster.io
+  resources:
+  - flexschedulers/status
+  verbs:
+  - get
