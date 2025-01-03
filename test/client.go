@@ -22,14 +22,16 @@ import (
 )
 
 type Client struct {
-	url  string
-	conn net.Conn
+	url       string
+	conn      net.Conn
+	connected bool
 }
 
 type Node struct {
 	clients []*Client
-	node    v1.Node
+	node    *v1.Node
 	wg      sync.WaitGroup
+	stopCh  chan struct{}
 	//allocateQueue map[string]ScheduleReq
 }
 
@@ -53,12 +55,11 @@ func (c *Client) sendMsg(m common.Message) {
 	}
 }
 
-func (n *Node) Start(stopCh chan bool) {
-	for _, c := range n.clients {
-		n.wg.Add(1)
-		n.StartClient(c)
-		go n.RunClient(c, stopCh)
+func (n *Node) Start(urlList []string) {
+	for _, u := range urlList {
+		n.Join(u)
 	}
+	n.PeriodicTask()
 	n.wg.Wait()
 	fmt.Println("All clients have finished.")
 }
@@ -66,21 +67,30 @@ func (n *Node) Start(stopCh chan bool) {
 func (n *Node) StartClient(c *Client) {
 	conn, _, _, err := ws.Dial(context.Background(), c.url)
 	if err != nil {
-		log.Fatalf("Failed to connect to WebSocket server: %v", err)
-		os.Exit(1)
+		fmt.Printf("Failed to connect to WebSocket server: %v\n", err)
+		return
 	}
 	c.conn = conn
+	c.connected = true
+	n.wg.Add(1)
+
+	n.RunClient(c)
 }
 
-func (n *Node) Report(c *Client, stopCh chan bool) {
+func (n *Node) PeriodicTask() {
 	for {
 		select {
-		case <-stopCh:
-			c.conn.Close()
+		case <-n.stopCh:
 			return
 		default:
-			n.doReport(c)
-			time.Sleep(10 * time.Second)
+			for _, c := range n.clients {
+				if c.connected { //report
+					n.doReport(c)
+				} else { // retry connect
+					go n.StartClient(c)
+				}
+			}
+			time.Sleep(common.HeartBeatTimeInterval)
 		}
 	}
 }
@@ -102,11 +112,6 @@ func (n *Node) handleSche(c *Client, m common.Message) {
 	var resRequired common.ScheduleConfirmationReq
 	//err := json.Unmarshal(m.Content.([]byte), &resRequired)
 	common.GetMsgFromContent(m.Content, &resRequired)
-	//resRequired, ok := m.Content.(common.ScheduleConfirmationReq)
-	//if !ok {
-	//	fmt.Printf("Unmarshal ScheduleConfirmationReq Error: %v", m.Content)
-	//	return
-	//}
 
 	if cpuAllocatable.Value()*1000 > resRequired.ComRequired[string(v1.ResourceCPU)] && memoryAllocatable.Value() > resRequired.ComRequired[string(v1.ResourceMemory)] {
 		message := common.Message{
@@ -137,15 +142,14 @@ func (n *Node) Allocate(s common.ScheduleReq) {
 	}
 }
 
-func (n *Node) RunClient(c *Client, stopCh chan bool) {
-	go n.Report(c, stopCh)
+func (n *Node) RunClient(c *Client) {
 	// 从服务器接收消息
 	for {
 		// 读取服务器发送的消息
 		data, op, err := wsutil.ReadServerData(c.conn)
 		if err != nil {
+			c.connected = false
 			log.Fatalf("Failed to read message: %v", err)
-			continue
 		}
 		// 打印接收到的消息
 		//fmt.Println("Received message:", string(data))
@@ -166,11 +170,6 @@ func (n *Node) RunClient(c *Client, stopCh chan bool) {
 				common.GetMsgFromContent(m.Content, &resAck)
 				//err := json.Unmarshal(m.Content.([]byte), &resAck)
 				fmt.Println("Received ScheduleConfirmationAck")
-				//resAck, ok := m.Content.(common.ScheduleConfirmationAck)
-				//if !ok {
-				//	fmt.Errorf("Unmarshal ScheduleConfirmationAck err: %v", m.Content)
-				//	return
-				//}
 				if resAck.Ack {
 					n.Allocate(resAck.ScheduleReq)
 					n.doReport(c)
@@ -191,8 +190,7 @@ func (n *Node) Join(url string) {
 	}
 	n.node.Annotations["clusterNum"] = strconv.Itoa(intc + 1)
 
-	n.StartClient(c)
-	go n.RunClient(c, stopCh)
+	go n.StartClient(c)
 }
 
 func parseFlag(nodeName, cpu, memory *string, deviceMap map[string]int, urlList *[]string) {
@@ -237,24 +235,9 @@ func parseFlag(nodeName, cpu, memory *string, deviceMap map[string]int, urlList 
 			*urlList = append(*urlList, u)
 		}
 	}
-
 }
 
-func main() {
-	var nodeName, cpu, memory string
-	var urlList []string
-	deviceMap := make(map[string]int)
-	parseFlag(&nodeName, &cpu, &memory, deviceMap, &urlList)
-	fmt.Println(nodeName, cpu, memory, deviceMap, urlList)
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		sig := <-sigs
-		fmt.Println()
-		fmt.Println(sig)
-		stopCh <- true
-	}()
-	// init node resource
+func newNode(nodeName, cpu, memory string, deviceMap map[string]int) *v1.Node {
 	node := v1.Node{}
 	node.Annotations = make(map[string]string)
 	node.Annotations["clusterNum"] = strconv.Itoa(1)
@@ -276,14 +259,31 @@ func main() {
 		node.Status.Capacity[v1.ResourceName(k)] = resource.MustParse(strconv.Itoa(v))
 		node.Status.Allocatable[v1.ResourceName(k)] = resource.MustParse(strconv.Itoa(v))
 	}
+	return &node
+}
+
+func main() {
+	var nodeName, cpu, memory string
+	var urlList []string
+	deviceMap := make(map[string]int)
+	parseFlag(&nodeName, &cpu, &memory, deviceMap, &urlList)
+	fmt.Println(nodeName, cpu, memory, deviceMap, urlList)
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+
+	// init node resource
+	node := newNode(nodeName, cpu, memory, deviceMap)
 	n := Node{
 		clients: []*Client{},
 		node:    node,
-	}
-	for _, u := range urlList {
-		c := NewClient(u)
-		n.clients = append(n.clients, c)
+		stopCh:  make(chan struct{}),
 	}
 
-	n.Start(stopCh)
+	go func() {
+		sig := <-sigs
+		fmt.Println("Received signal: ", sig)
+		close(n.stopCh)
+	}()
+
+	n.Start(urlList)
 }

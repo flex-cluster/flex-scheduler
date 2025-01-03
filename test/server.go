@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"github.com/flex-cluster/flex-scheduler/internal/controller"
 	"github.com/flex-cluster/flex-scheduler/test/common"
@@ -19,6 +20,8 @@ import (
 	"net"
 	"net/http"
 	"strings"
+
+	_ "net/http/pprof"
 )
 
 type scheTask struct {
@@ -32,10 +35,12 @@ type NodeItem struct {
 }
 
 type Server struct {
+	server    *http.Server
 	addr      string
 	conns     map[string]*net.Conn
 	scheQueue map[string]scheTask
 	nodeMap   map[string]NodeItem
+	stopCh    chan struct{}
 }
 
 func NewServer(addr string) *Server {
@@ -44,6 +49,7 @@ func NewServer(addr string) *Server {
 		nodeMap:   make(map[string]NodeItem),
 		conns:     make(map[string]*net.Conn),
 		scheQueue: make(map[string]scheTask),
+		stopCh:    make(chan struct{}),
 	}
 }
 
@@ -116,17 +122,21 @@ func GetNodeFromInterface(data interface{}, node *v1.Node) {
 	}
 }
 
-func (s *Server) Start(stopCh chan bool) {
+func (s *Server) Start() {
 	http.HandleFunc("/schedule", s.handleSchedule)
 	http.HandleFunc("/ws", s.handleWebSocket)
 
-	go s.PeriodicCheck(stopCh)
+	go s.PeriodicCheck()
 	// 启动 HTTP 服务器
 	log.Printf("HTTP server started on http://%s/schedule\n", s.addr)
 	log.Printf("WebSocket server started on ws://%s/ws\n", s.addr)
-	err := http.ListenAndServe(s.addr, nil)
-	if err != nil {
-		log.Fatal("Error starting server: ", err)
+	server := &http.Server{
+		Addr:    s.addr, // 设置服务器地址
+		Handler: nil,    // 默认使用 http.DefaultServeMux（即 http.HandleFunc 注册的路由）
+	}
+	s.server = server
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		fmt.Println("Server failed:", err)
 	}
 }
 
@@ -137,16 +147,16 @@ func (s *Server) updateNodeList(newNode *v1.Node) {
 	}
 }
 
-func (s *Server) PeriodicCheck(stopCh chan bool) {
+func (s *Server) PeriodicCheck() {
 	for {
 		select {
-		case <-stopCh:
+		case <-s.stopCh:
 			return
 		default:
 			// check scheQueue
 			for k, t := range s.scheQueue {
-				delta := time.Now().UnixMicro() - t.time.UnixMicro()
-				if delta > 60*1000*1000 { // 1 minute
+				delta := time.Now().Unix() - t.time.Unix()
+				if delta > int64(common.HeartBeatTimeInterval.Seconds()) { // 1 minute
 					s.writeFile(t.scheReq, "failed")
 					delete(s.scheQueue, k)
 				}
@@ -154,8 +164,8 @@ func (s *Server) PeriodicCheck(stopCh chan bool) {
 
 			// check node status
 			for name, ni := range s.nodeMap {
-				delta := time.Now().UnixMicro() - ni.time.UnixMicro()
-				if delta > 60*1000*1000 {
+				delta := time.Now().Unix() - ni.time.Unix()
+				if delta > int64((common.HeartBeatTimeInterval * 2).Seconds()) {
 					setNodeNotReady(s.nodeMap[name].node)
 				}
 			}
@@ -208,15 +218,11 @@ func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) HandleWSMessage(conn *net.Conn, m common.Message) {
-	fmt.Println("HandleWSMessage: ", m.MessageType)
+	//fmt.Println("HandleWSMessage: ", m.MessageType)
 	switch m.MessageType {
 	case common.NodeMessageType:
 		var node v1.Node
-		//err := json.Unmarshal(m.Content, &node)
-		//fmt.Println("Received NodeMessage: ")
-		//fmt.Printf("Type of m.Content: %T\n", m.Content)
 		GetNodeFromInterface(m.Content, &node)
-		//fmt.Println("Received NodeMessage: ", node)
 		s.updateNodeList(&node)
 		s.conns[node.Name] = conn
 		break
@@ -235,6 +241,7 @@ func (s *Server) HandleWSMessage(conn *net.Conn, m common.Message) {
 			nodeName := res.NodeName
 			//clientIP := getClientIP(conn)
 			latency := time.Now().UnixMicro() - scheReq.time.UnixMicro()
+			fmt.Println("Successful shceduled to ", nodeName)
 			s.writeFile(scheReq.scheReq, nodeName, latency)
 			ackMsg := common.Message{
 				MessageType: common.ScheduleConfirmationAckType,
@@ -270,24 +277,15 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		log.Println("Failed to upgrade connection:", err)
 		return
 	}
-	defer conn.Close()
-	//clientIP := getClientIP(conn)
-	//s.conns[clientIP] = &conn
-
-	// 向客户端发送欢迎消息
-	//err = wsutil.WriteServerText(conn, []byte("Welcome to the WebSocket server!"))
-	//if err != nil {
-	//	log.Println("Error writing message to client:", err)
-	//	return
-	//}
 
 	// 监听客户端发来的消息
 	for {
 		// 读取客户端消息
 		data, op, err := wsutil.ReadClientData(conn)
 		if err != nil {
-			if err.Error() != "EOF" {
+			if err.Error() == "EOF" || err.Error() == "connection reset by peer" {
 				log.Println("Error reading message:", err)
+				break
 			}
 			continue
 		}
@@ -301,10 +299,10 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				log.Println("Error unmarshal message:", err)
 				continue
 			}
-			s.HandleWSMessage(&conn, m)
+			go s.HandleWSMessage(&conn, m)
 		}
-
 	}
+	conn.Close()
 }
 
 func (s *Server) writeFile(values ...interface{}) {
@@ -339,13 +337,26 @@ func main() {
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	var stopCh chan bool
-	go func() {
-		sig := <-sigs
-		fmt.Println()
-		fmt.Println(sig)
-		stopCh <- true
-	}()
+
+	//go func() {
+	//	// pprof 服务器，将暴露在 6060 端口
+	//	if err := http.ListenAndServe(":6060", nil); err != nil {
+	//		panic(err)
+	//	}
+	//}()
 	s := NewServer(addr)
-	s.Start(stopCh)
+	go s.Start()
+
+	sig := <-sigs
+	fmt.Println("Received signal: ", sig)
+	close(s.stopCh)
+
+	fmt.Println("Shutting down server...")
+	// 设置超时时间，等待处理中的请求
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.server.Shutdown(ctx); err != nil {
+		fmt.Println("Server forced to shutdown:", err)
+	}
+	fmt.Println("Server exited")
 }
