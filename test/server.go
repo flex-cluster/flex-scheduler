@@ -11,6 +11,8 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/json"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"log"
@@ -24,17 +26,22 @@ type scheTask struct {
 	scheReq common.ScheduleReq
 }
 
+type NodeItem struct {
+	time time.Time
+	node *v1.Node
+}
+
 type Server struct {
 	addr      string
-	nodeList  v1.NodeList
 	conns     map[string]*net.Conn
 	scheQueue map[string]scheTask
+	nodeMap   map[string]NodeItem
 }
 
 func NewServer(addr string) *Server {
 	return &Server{
 		addr:      addr,
-		nodeList:  v1.NodeList{},
+		nodeMap:   make(map[string]NodeItem),
 		conns:     make(map[string]*net.Conn),
 		scheQueue: make(map[string]scheTask),
 	}
@@ -59,6 +66,36 @@ func getClientIP(conn net.Conn) string {
 	return clientIP
 }
 
+func contains(slice []string, value string) bool {
+	for _, v := range slice {
+		if v == value {
+			return true
+		}
+	}
+	return false
+}
+
+func setNodeNotReady(n *v1.Node) {
+	for i, condition := range n.Status.Conditions {
+		if condition.Type == "Ready" {
+			n.Status.Conditions[i].Status = "False"
+			n.Status.Conditions[i].Reason = "NodeNotReady"
+			n.Status.Conditions[i].Message = "Heartbeat timeout."
+		}
+	}
+}
+
+func IsNodeReady(n *v1.Node) bool {
+	for i, condition := range n.Status.Conditions {
+		if condition.Type == "Ready" {
+			if n.Status.Conditions[i].Status == "True" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func GetNodeFromInterface(data interface{}, node *v1.Node) {
 	switch data.(type) {
 	case map[string]interface{}:
@@ -79,9 +116,11 @@ func GetNodeFromInterface(data interface{}, node *v1.Node) {
 	}
 }
 
-func (s *Server) Start() {
+func (s *Server) Start(stopCh chan bool) {
 	http.HandleFunc("/schedule", s.handleSchedule)
 	http.HandleFunc("/ws", s.handleWebSocket)
+
+	go s.PeriodicCheck(stopCh)
 	// 启动 HTTP 服务器
 	log.Printf("HTTP server started on http://%s/schedule\n", s.addr)
 	log.Printf("WebSocket server started on ws://%s/ws\n", s.addr)
@@ -91,23 +130,38 @@ func (s *Server) Start() {
 	}
 }
 
-func (s *Server) updateNodeList(newNode v1.Node) {
-	// 遍历 NodeList，查找与 newNode 相同 Name 的节点并更新
-	found := false
-	//fmt.Println("updateNodeList: ", s.nodeList)
-	for i, node := range s.nodeList.Items {
-		if node.Name == newNode.Name {
-			// 更新 Capacity（假设我们只更新 Capacity）
-			s.nodeList.Items[i].Status.Capacity = newNode.Status.Capacity
-			s.nodeList.Items[i].Status.Allocatable = newNode.Status.Allocatable
-			found = true
-			break // 一旦找到就退出循环
+func (s *Server) updateNodeList(newNode *v1.Node) {
+	s.nodeMap[newNode.Name] = NodeItem{
+		time: time.Now(),
+		node: newNode,
+	}
+}
+
+func (s *Server) PeriodicCheck(stopCh chan bool) {
+	for {
+		select {
+		case <-stopCh:
+			return
+		default:
+			// check scheQueue
+			for k, t := range s.scheQueue {
+				delta := time.Now().UnixMicro() - t.time.UnixMicro()
+				if delta > 60*1000*1000 { // 1 minute
+					s.writeFile(t.scheReq, "failed")
+					delete(s.scheQueue, k)
+				}
+			}
+
+			// check node status
+			for name, ni := range s.nodeMap {
+				delta := time.Now().UnixMicro() - ni.time.UnixMicro()
+				if delta > 60*1000*1000 {
+					setNodeNotReady(s.nodeMap[name].node)
+				}
+			}
+			time.Sleep(60 * time.Second)
 		}
 	}
-	if !found {
-		s.nodeList.Items = append(s.nodeList.Items, newNode)
-	}
-	//fmt.Println("nodeList: ", s.nodeList)
 }
 
 func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
@@ -125,14 +179,20 @@ func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
 		fmt.Errorf("Unmarshal request body failed.", err)
 		return
 	}
-	fmt.Println("Received ScheduleReq: ", req, "Node list: ", s.nodeList)
+	var nodeList v1.NodeList
+	for _, ni := range s.nodeMap {
+		if IsNodeReady(ni.node) {
+			nodeList.Items = append(nodeList.Items, *(ni.node))
+		}
+	}
+	fmt.Println("Received ScheduleReq: ", req, "Node list: ", nodeList)
 	uid := uuid.New().String()
 	stask := scheTask{
 		time:    time.Now(),
 		scheReq: req,
 	}
 	s.scheQueue[uid] = stask
-	nodes := controller.SelectNodeBasedOnResources(&(s.nodeList), req.ComRequired, req.DeviceRequired)
+	nodes := controller.SelectNodeBasedOnResources(&nodeList, req.ComRequired, req.DeviceRequired)
 	fmt.Println("SelectNodeBasedOnResources: ", nodes)
 	m := common.Message{}
 	m.MessageType = common.ScheduleConfirmationReqType
@@ -157,7 +217,7 @@ func (s *Server) HandleWSMessage(conn *net.Conn, m common.Message) {
 		//fmt.Printf("Type of m.Content: %T\n", m.Content)
 		GetNodeFromInterface(m.Content, &node)
 		//fmt.Println("Received NodeMessage: ", node)
-		s.updateNodeList(node)
+		s.updateNodeList(&node)
 		s.conns[node.Name] = conn
 		break
 	case common.ScheduleConfirmationResType:
@@ -276,6 +336,16 @@ func main() {
 	if len(os.Args) > 1 {
 		addr = os.Args[1]
 	}
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	var stopCh chan bool
+	go func() {
+		sig := <-sigs
+		fmt.Println()
+		fmt.Println(sig)
+		stopCh <- true
+	}()
 	s := NewServer(addr)
-	s.Start()
+	s.Start(stopCh)
 }

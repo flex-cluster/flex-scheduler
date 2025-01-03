@@ -260,6 +260,10 @@ func main() {
 	node.Annotations["clusterNum"] = strconv.Itoa(1)
 	node.Name = nodeName
 	node.Spec.PodCIDR = ""
+	node.Status.Conditions = []v1.NodeCondition{v1.NodeCondition{
+		Type:   "Ready",
+		Status: "True"},
+	}
 	node.Status.Capacity = v1.ResourceList{
 		v1.ResourceCPU:    resource.MustParse(cpu), // 16 CPU cores
 		v1.ResourceMemory: resource.MustParse(memory),
