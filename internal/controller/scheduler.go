@@ -113,16 +113,16 @@ func getNodeResources(node v1.Node) map[string]int64 {
 // getNodeLoad 获取节点的负载信息
 func getNodeLoad(node v1.Node) int {
 	cpuCapacity := node.Status.Capacity[v1.ResourceCPU]
-	memoryCapacity := node.Status.Capacity[v1.ResourceMemory]
-
-	// 打印节点的资源信息
-	fmt.Printf("Node: %s\n", node.Name)
-	fmt.Printf("CPU Capacity: %s\n", cpuCapacity.String())
-	fmt.Printf("Memory Capacity: %s\n", memoryCapacity.String())
+	//memoryCapacity := node.Status.Capacity[v1.ResourceMemory]
 
 	// 可分配资源
 	cpuAllocatable := node.Status.Allocatable[v1.ResourceCPU]
-	//memoryAllocatable := node.Status.Allocatable[v1.ResourceMemory]
+	memoryAllocatable := node.Status.Allocatable[v1.ResourceMemory]
+
+	// 打印节点的资源信息
+	fmt.Printf("Node: %s\n", node.Name)
+	fmt.Printf("CPU Capacity: %s\n", cpuAllocatable.String())
+	fmt.Printf("Memory Capacity: %s\n", memoryAllocatable.String())
 
 	result := float32(cpuAllocatable.Value()) / float32(cpuCapacity.Value()) * 100
 	// 返回转化后的整数值，保留两位小数

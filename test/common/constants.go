@@ -2,4 +2,4 @@ package common
 
 import "time"
 
-var HeartBeatTimeInterval = 60 * time.Second
+var HeartBeatTimeInterval = 30 * time.Second

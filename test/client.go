@@ -16,7 +16,6 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -30,12 +29,8 @@ type Client struct {
 type Node struct {
 	clients []*Client
 	node    *v1.Node
-	wg      sync.WaitGroup
 	stopCh  chan struct{}
-	//allocateQueue map[string]ScheduleReq
 }
-
-var stopCh chan bool
 
 func NewClient(url string) *Client {
 	c := &Client{
@@ -60,7 +55,6 @@ func (n *Node) Start(urlList []string) {
 		n.Join(u)
 	}
 	n.PeriodicTask()
-	n.wg.Wait()
 	fmt.Println("All clients have finished.")
 }
 
@@ -72,8 +66,6 @@ func (n *Node) StartClient(c *Client) {
 	}
 	c.conn = conn
 	c.connected = true
-	n.wg.Add(1)
-
 	n.RunClient(c)
 }
 
@@ -81,8 +73,10 @@ func (n *Node) PeriodicTask() {
 	for {
 		select {
 		case <-n.stopCh:
+			fmt.Println("PeriodicTask Exiting")
 			return
 		default:
+			time.Sleep(common.HeartBeatTimeInterval)
 			for _, c := range n.clients {
 				if c.connected { //report
 					n.doReport(c)
@@ -90,7 +84,6 @@ func (n *Node) PeriodicTask() {
 					go n.StartClient(c)
 				}
 			}
-			time.Sleep(common.HeartBeatTimeInterval)
 		}
 	}
 }
@@ -143,13 +136,14 @@ func (n *Node) Allocate(s common.ScheduleReq) {
 }
 
 func (n *Node) RunClient(c *Client) {
+	n.doReport(c)
 	// 从服务器接收消息
 	for {
-		// 读取服务器发送的消息
 		data, op, err := wsutil.ReadServerData(c.conn)
 		if err != nil {
 			c.connected = false
-			log.Fatalf("Failed to read message: %v", err)
+			//fmt.Printf("Failed to read message: %v", err)
+			return
 		}
 		// 打印接收到的消息
 		//fmt.Println("Received message:", string(data))
@@ -157,27 +151,32 @@ func (n *Node) RunClient(c *Client) {
 			var m common.Message
 			err = json.Unmarshal(data, &m)
 			if err != nil {
-				log.Fatalf("Failed to unmarshal message: %v", err)
-				continue
+				fmt.Printf("Failed to unmarshal message: %v", err)
+				return
 			}
-			switch m.MessageType {
-			case common.ScheduleConfirmationReqType:
-				fmt.Println("Received ScheduleConfirmationReq")
-				n.handleSche(c, m)
-				break
-			case common.ScheduleConfirmationAckType:
-				var resAck common.ScheduleConfirmationAck
-				common.GetMsgFromContent(m.Content, &resAck)
-				//err := json.Unmarshal(m.Content.([]byte), &resAck)
-				fmt.Println("Received ScheduleConfirmationAck")
-				if resAck.Ack {
-					n.Allocate(resAck.ScheduleReq)
-					n.doReport(c)
-				}
-			}
+			go n.HandleMSG(c, m)
 		}
 	}
-	n.wg.Done()
+	c.conn.Close()
+	c.connected = false
+}
+
+func (n *Node) HandleMSG(c *Client, m common.Message) {
+	switch m.MessageType {
+	case common.ScheduleConfirmationReqType:
+		fmt.Println("Received ScheduleConfirmationReq")
+		n.handleSche(c, m)
+		break
+	case common.ScheduleConfirmationAckType:
+		var resAck common.ScheduleConfirmationAck
+		common.GetMsgFromContent(m.Content, &resAck)
+		//err := json.Unmarshal(m.Content.([]byte), &resAck)
+		fmt.Println("Received ScheduleConfirmationAck")
+		if resAck.Ack {
+			n.Allocate(resAck.ScheduleReq)
+			n.doReport(c)
+		}
+	}
 }
 
 func (n *Node) Join(url string) {
@@ -279,11 +278,14 @@ func main() {
 		stopCh:  make(chan struct{}),
 	}
 
-	go func() {
-		sig := <-sigs
-		fmt.Println("Received signal: ", sig)
-		close(n.stopCh)
-	}()
+	go n.Start(urlList)
+	sig := <-sigs
+	fmt.Println("Received signal: ", sig)
+	close(n.stopCh)
 
-	n.Start(urlList)
+	for _, c := range n.clients {
+		if c.connected {
+			c.conn.Close()
+		}
+	}
 }

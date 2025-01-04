@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/json"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -37,48 +38,17 @@ type NodeItem struct {
 type Server struct {
 	server    *http.Server
 	addr      string
-	conns     map[string]*net.Conn
-	scheQueue map[string]scheTask
-	nodeMap   map[string]NodeItem
+	conns     sync.Map //map[string]*net.Conn
+	scheQueue sync.Map //map[string]scheTask
+	nodeMap   sync.Map //map[string]NodeItem
 	stopCh    chan struct{}
 }
 
 func NewServer(addr string) *Server {
 	return &Server{
-		addr:      addr,
-		nodeMap:   make(map[string]NodeItem),
-		conns:     make(map[string]*net.Conn),
-		scheQueue: make(map[string]scheTask),
-		stopCh:    make(chan struct{}),
+		addr:   addr,
+		stopCh: make(chan struct{}),
 	}
-}
-
-func getNodeIP(node *v1.Node) string {
-	// 遍历节点的地址列表
-	for _, address := range node.Status.Addresses {
-		// 查找类型为 InternalIP 的地址
-		if address.Type == v1.NodeInternalIP {
-			return address.Address
-		}
-	}
-	// 如果没有找到 InternalIP，则返回空字符串
-	return ""
-}
-
-func getClientIP(conn net.Conn) string {
-	clientAddr := conn.RemoteAddr().String()
-	strAddr := strings.Split(clientAddr, ":")
-	clientIP := strAddr[0]
-	return clientIP
-}
-
-func contains(slice []string, value string) bool {
-	for _, v := range slice {
-		if v == value {
-			return true
-		}
-	}
-	return false
 }
 
 func setNodeNotReady(n *v1.Node) {
@@ -141,10 +111,16 @@ func (s *Server) Start() {
 }
 
 func (s *Server) updateNodeList(newNode *v1.Node) {
-	s.nodeMap[newNode.Name] = NodeItem{
+	n := NodeItem{
 		time: time.Now(),
 		node: newNode,
 	}
+	s.nodeMap.Store(newNode.Name, n)
+	fmt.Println("updateNodeList, nodeList: ")
+	s.nodeMap.Range(func(key, value any) bool {
+		fmt.Println("k: ", key, "v: ", value.(NodeItem))
+		return true
+	})
 }
 
 func (s *Server) PeriodicCheck() {
@@ -154,21 +130,26 @@ func (s *Server) PeriodicCheck() {
 			return
 		default:
 			// check scheQueue
-			for k, t := range s.scheQueue {
-				delta := time.Now().Unix() - t.time.Unix()
+			s.scheQueue.Range(func(key, value interface{}) bool {
+				task := value.(scheTask)
+				delta := time.Now().Unix() - task.time.Unix()
 				if delta > int64(common.HeartBeatTimeInterval.Seconds()) { // 1 minute
-					s.writeFile(t.scheReq, "failed")
-					delete(s.scheQueue, k)
+					s.writeFile(task.scheReq, "failed")
+					s.scheQueue.Delete(key)
 				}
-			}
+				return true
+			})
 
 			// check node status
-			for name, ni := range s.nodeMap {
+			s.nodeMap.Range(func(key, value interface{}) bool {
+				ni := value.(NodeItem)
 				delta := time.Now().Unix() - ni.time.Unix()
 				if delta > int64((common.HeartBeatTimeInterval * 2).Seconds()) {
-					setNodeNotReady(s.nodeMap[name].node)
+					setNodeNotReady(ni.node)
+					s.nodeMap.Store(key, ni)
 				}
-			}
+				return true
+			})
 			time.Sleep(60 * time.Second)
 		}
 	}
@@ -190,18 +171,20 @@ func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var nodeList v1.NodeList
-	for _, ni := range s.nodeMap {
+	s.nodeMap.Range(func(key, value any) bool {
+		ni := value.(NodeItem)
 		if IsNodeReady(ni.node) {
 			nodeList.Items = append(nodeList.Items, *(ni.node))
 		}
-	}
+		return true
+	})
 	fmt.Println("Received ScheduleReq: ", req, "Node list: ", nodeList)
 	uid := uuid.New().String()
 	stask := scheTask{
 		time:    time.Now(),
 		scheReq: req,
 	}
-	s.scheQueue[uid] = stask
+	s.scheQueue.Store(uid, stask)
 	nodes := controller.SelectNodeBasedOnResources(&nodeList, req.ComRequired, req.DeviceRequired)
 	fmt.Println("SelectNodeBasedOnResources: ", nodes)
 	m := common.Message{}
@@ -224,7 +207,7 @@ func (s *Server) HandleWSMessage(conn *net.Conn, m common.Message) {
 		var node v1.Node
 		GetNodeFromInterface(m.Content, &node)
 		s.updateNodeList(&node)
-		s.conns[node.Name] = conn
+		s.conns.Store(node.Name, conn)
 		break
 	case common.ScheduleConfirmationResType:
 		var res common.ScheduleConfirmationRes
@@ -235,18 +218,19 @@ func (s *Server) HandleWSMessage(conn *net.Conn, m common.Message) {
 		//	return
 		//}
 		fmt.Println("Received ScheduleConfirmationRes")
-		scheReq, ok := s.scheQueue[m.MessageID]
+		v, ok := s.scheQueue.Load(m.MessageID)
 		if res.Confirmed && ok {
-			delete(s.scheQueue, m.MessageID)
+			scheTask := v.(scheTask)
+			s.scheQueue.Delete(m.MessageID)
 			nodeName := res.NodeName
 			//clientIP := getClientIP(conn)
-			latency := time.Now().UnixMicro() - scheReq.time.UnixMicro()
+			latency := time.Now().UnixMicro() - scheTask.time.UnixMicro()
 			fmt.Println("Successful shceduled to ", nodeName)
-			s.writeFile(scheReq.scheReq, nodeName, latency)
+			s.writeFile(scheTask.scheReq, nodeName, latency)
 			ackMsg := common.Message{
 				MessageType: common.ScheduleConfirmationAckType,
 				MessageID:   m.MessageID,
-				Content:     common.ScheduleConfirmationAck{ScheduleReq: scheReq.scheReq, Ack: true},
+				Content:     common.ScheduleConfirmationAck{ScheduleReq: scheTask.scheReq, Ack: true},
 			}
 			s.sendMsg(nodeName, ackMsg)
 		}
@@ -257,7 +241,12 @@ func (s *Server) HandleWSMessage(conn *net.Conn, m common.Message) {
 }
 
 func (s *Server) sendMsg(node string, m common.Message) {
-	conn := s.conns[node]
+	v, ok := s.conns.Load(node)
+	if !ok {
+		fmt.Printf("load conn for node %s failed", node)
+		return
+	}
+	conn := v.(*net.Conn)
 	bm, err := json.Marshal(m)
 	if err != nil {
 		fmt.Errorf("Marshal Message err :%v", err)
