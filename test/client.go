@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -27,9 +28,15 @@ type Client struct {
 }
 
 type Node struct {
-	clients []*Client
-	node    *v1.Node
-	stopCh  chan struct{}
+	clients   []*Client
+	node      *v1.Node
+	scheQueue sync.Map
+	stopCh    chan struct{}
+}
+
+type scheTask struct {
+	time    time.Time
+	scheReq common.ScheduleReq
 }
 
 func NewClient(url string) *Client {
@@ -113,11 +120,42 @@ func (n *Node) handleSche(c *Client, m common.Message) {
 			Content:     common.ScheduleConfirmationRes{NodeName: n.node.Name, Confirmed: true},
 		}
 		fmt.Println("send ScheduleConfirmationRes")
+		stask := scheTask{
+			time:    time.Now(),
+			scheReq: resRequired.ScheduleReq,
+		}
+		n.scheQueue.Store(m.MessageID, stask)
+		n.Allocate(resRequired.ScheduleReq)
+		c.sendMsg(message)
+	} else {
+		message := common.Message{
+			MessageType: common.ScheduleConfirmationResType,
+			MessageID:   m.MessageID,
+			Content:     common.ScheduleConfirmationRes{NodeName: n.node.Name, Confirmed: false},
+		}
 		c.sendMsg(message)
 	}
 }
 
 func (n *Node) Allocate(s common.ScheduleReq) {
+	cpuAllocatable := n.node.Status.Allocatable[v1.ResourceCPU]
+	memoryAllocatable := n.node.Status.Allocatable[v1.ResourceMemory]
+	nowCPU := cpuAllocatable.Value()*1000 - s.ComRequired[string(v1.ResourceCPU)]
+	nowMem := memoryAllocatable.Value()/1024/1024 - s.ComRequired[string(v1.ResourceMemory)]
+	n.node.Status.Allocatable[v1.ResourceCPU] = resource.MustParse(fmt.Sprintf("%dm", nowCPU))
+	n.node.Status.Allocatable[v1.ResourceMemory] = resource.MustParse(fmt.Sprintf("%dMi", nowMem))
+
+	for d, c := range s.DeviceRequired {
+		nowD := 0
+		allocatableD := n.node.Status.Allocatable[v1.ResourceName(d)]
+		if allocatableD.Value() > c {
+			nowD = int(allocatableD.Value() - c)
+		}
+		n.node.Status.Allocatable[v1.ResourceName(d)] = resource.MustParse(strconv.Itoa(nowD))
+	}
+}
+
+func (n *Node) UnAllocate(s common.ScheduleReq) {
 	cpuAllocatable := n.node.Status.Allocatable[v1.ResourceCPU]
 	memoryAllocatable := n.node.Status.Allocatable[v1.ResourceMemory]
 	nowCPU := cpuAllocatable.Value()*1000 - s.ComRequired[string(v1.ResourceCPU)]
@@ -172,10 +210,13 @@ func (n *Node) HandleMSG(c *Client, m common.Message) {
 		common.GetMsgFromContent(m.Content, &resAck)
 		//err := json.Unmarshal(m.Content.([]byte), &resAck)
 		fmt.Println("Received ScheduleConfirmationAck")
-		if resAck.Ack {
-			n.Allocate(resAck.ScheduleReq)
-			n.doReport(c)
+		v, ok := n.scheQueue.Load(m.MessageID)
+		if !resAck.Ack && ok {
+			scheTask := v.(scheTask)
+			n.UnAllocate(scheTask.scheReq)
 		}
+		n.scheQueue.Delete(m.MessageID)
+		n.doReport(c)
 	}
 }
 

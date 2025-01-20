@@ -41,7 +41,6 @@ type ScheduleConfirmationRes struct {
 }
 
 type ScheduleConfirmationAck struct {
-	ScheduleReq
 	Ack bool
 }
 

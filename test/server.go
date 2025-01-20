@@ -218,21 +218,32 @@ func (s *Server) HandleWSMessage(conn *net.Conn, m common.Message) {
 		//	return
 		//}
 		fmt.Println("Received ScheduleConfirmationRes")
-		v, ok := s.scheQueue.Load(m.MessageID)
-		if res.Confirmed && ok {
-			scheTask := v.(scheTask)
-			s.scheQueue.Delete(m.MessageID)
-			nodeName := res.NodeName
-			//clientIP := getClientIP(conn)
-			latency := time.Now().UnixMicro() - scheTask.time.UnixMicro()
-			fmt.Println("Successful shceduled to ", nodeName)
-			s.writeFile(scheTask.scheReq, nodeName, latency)
-			ackMsg := common.Message{
-				MessageType: common.ScheduleConfirmationAckType,
-				MessageID:   m.MessageID,
-				Content:     common.ScheduleConfirmationAck{ScheduleReq: scheTask.scheReq, Ack: true},
+
+		if res.Confirmed {
+			v, ok := s.scheQueue.Load(m.MessageID)
+			if ok {
+				scheTask := v.(scheTask)
+				s.scheQueue.Delete(m.MessageID)
+				nodeName := res.NodeName
+				//clientIP := getClientIP(conn)
+				latency := time.Now().UnixMicro() - scheTask.time.UnixMicro()
+				fmt.Println("Successful shceduled to ", nodeName)
+				s.writeFile(scheTask.scheReq, nodeName, latency)
+				ackMsg := common.Message{
+					MessageType: common.ScheduleConfirmationAckType,
+					MessageID:   m.MessageID,
+					Content:     common.ScheduleConfirmationAck{Ack: true},
+				}
+				s.sendMsg(nodeName, ackMsg)
+			} else {
+				nodeName := res.NodeName
+				ackMsg := common.Message{
+					MessageType: common.ScheduleConfirmationAckType,
+					MessageID:   m.MessageID,
+					Content:     common.ScheduleConfirmationAck{Ack: false},
+				}
+				s.sendMsg(nodeName, ackMsg)
 			}
-			s.sendMsg(nodeName, ackMsg)
 		}
 		break
 	default:
